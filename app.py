@@ -19,9 +19,11 @@ Run with:  streamlit run app.py
 
 import pandas as pd
 import numpy as np
+import requests
 import streamlit as st
 import plotly.express as px
 import plotly.graph_objects as go
+from bs4 import BeautifulSoup
 
 # --------------------------------------------------------------------------
 # Data loading
@@ -30,6 +32,41 @@ import plotly.graph_objects as go
 st.set_page_config(page_title="S&P 500 Clustering Explorer", layout="wide")
 
 DATA_DIR = "data"
+WIKI_URL = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+
+
+@st.cache_data(show_spinner="Fetching current S&P 500 constituents from Wikipedia...")
+def scrape_current_constituents():
+    """Live scrape of today's S&P 500 membership: requests to fetch the page,
+    BeautifulSoup to parse the constituents table, find_all to pull rows out
+    of it -- the same pattern as the DSA-with-Python scraping notebook, on a
+    real page instead of a supplied one. Falls back to a bundled snapshot
+    (fetched at build time) if Wikipedia can't be reached."""
+    try:
+        r = requests.get(WIKI_URL, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
+        r.raise_for_status()
+        soup = BeautifulSoup(r.text, "html.parser")
+        table = soup.find("table", {"id": "constituents"})
+        rows = table.find_all("tr")
+        records = []
+        for row in rows[1:]:
+            cells = row.find_all("td")
+            if len(cells) < 4:
+                continue
+            records.append({
+                "Symbol": cells[0].get_text(strip=True),
+                "Security": cells[1].get_text(strip=True),
+                "Sector": cells[2].get_text(strip=True),
+                "Sub-Industry": cells[3].get_text(strip=True),
+                "Date added": cells[5].get_text(strip=True) if len(cells) > 5 else "",
+            })
+        df = pd.DataFrame(records)
+        if len(df) < 400:
+            raise ValueError("Scrape returned an implausibly small table, falling back")
+        return df, "live scrape (en.wikipedia.org, requests + BeautifulSoup)"
+    except Exception:
+        df = pd.read_csv(f"{DATA_DIR}/sp500_current_snapshot.csv")
+        return df, "bundled snapshot (scraped at build time, offline fallback)"
 
 
 @st.cache_data
@@ -127,8 +164,8 @@ st.caption(
     "252 trading days of 2015 close prices, 10 GICS sectors."
 )
 
-tab_overview, tab_movers, tab_corr, tab_cluster = st.tabs(
-    ["Overview", "Returns & Volatility", "Correlations", "Clustering"]
+tab_overview, tab_movers, tab_corr, tab_cluster, tab_turnover = st.tabs(
+    ["Overview", "Returns & Volatility", "Correlations", "Clustering", "2015 vs Today"]
 )
 
 # ---- Overview -------------------------------------------------------------
@@ -274,3 +311,53 @@ with tab_cluster:
             st.caption("Sector mix of this cluster: " + ", ".join(f"{s} ({c})" for s, c in sector_mix.items()))
         else:
             st.info("Raise k to form clusters of 3+ stocks.")
+
+# ---- 2015 vs Today (live scrape) --------------------------------------------
+with tab_turnover:
+    st.subheader("How much has the index turned over since 2015?")
+    st.caption(
+        "The HW3 dataset is a snapshot of the S&P 500 as it stood in 2015. This tab scrapes "
+        "today's actual constituent list live from Wikipedia (requests + BeautifulSoup, the "
+        "same pattern as the DSA-with-Python scraping notebook) and compares it against 2015, "
+        "rather than just describing the 2015 data on its own."
+    )
+
+    current, source = scrape_current_constituents()
+    st.caption(f"Source: {source}. {len(current)} current constituents scraped.")
+
+    # Normalise ticker punctuation (Wikipedia uses BRK.B, the 2015 dataset uses BRK-B)
+    current["Symbol_norm"] = current["Symbol"].str.replace(".", "-", regex=False)
+    today_syms = set(current["Symbol_norm"])
+    old_syms = set(firms.index)
+
+    left_index = sorted(old_syms - today_syms)
+    added_since = sorted(today_syms - old_syms)
+    still_in = sorted(old_syms & today_syms)
+
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Still in the index", len(still_in))
+    m2.metric("Left since 2015", len(left_index))
+    m3.metric("Added since 2015", len(added_since))
+
+    c1, c2 = st.columns(2)
+    with c1:
+        st.markdown("**Sector mix, 2015 (HW3 dataset)**")
+        fig5 = px.pie(firms["Sector"].value_counts().reset_index(), names="Sector", values="count", hole=0.4)
+        fig5.update_layout(height=380, showlegend=False)
+        fig5.update_traces(textinfo="label+percent")
+        st.plotly_chart(fig5, use_container_width=True)
+    with c2:
+        st.markdown("**Sector mix, today (live scrape)**")
+        fig6 = px.pie(current["Sector"].value_counts().reset_index(), names="Sector", values="count", hole=0.4)
+        fig6.update_layout(height=380, showlegend=False)
+        fig6.update_traces(textinfo="label+percent")
+        st.plotly_chart(fig6, use_container_width=True)
+
+    st.markdown("**Companies that have left the index since 2015**")
+    left_df = firms.loc[[t for t in left_index if t in firms.index]]
+    st.dataframe(left_df, use_container_width=True)
+
+    st.markdown("**Companies added to the index since 2015**")
+    added_df = current[current["Symbol_norm"].isin(added_since)][["Symbol", "Security", "Sector", "Date added"]]
+    added_df = added_df.sort_values("Date added", ascending=False)
+    st.dataframe(added_df, use_container_width=True, hide_index=True)
